@@ -30,13 +30,14 @@ type Server struct {
 	debugStream   io.Writer
 	readOnly      bool
 	pktMgr        *packetManager
-	openFiles     map[string]*os.File
+	openFiles     map[string]SftpFileHandle
 	openFilesLock sync.RWMutex
 	handleCount   int
 	maxTxPacket   uint32
+	packetHandler SftpPacketHandler
 }
 
-func (svr *Server) nextHandle(f *os.File) string {
+func (svr *Server) nextHandle(f SftpFileHandle) string {
 	svr.openFilesLock.Lock()
 	defer svr.openFilesLock.Unlock()
 	svr.handleCount++
@@ -56,7 +57,7 @@ func (svr *Server) closeHandle(handle string) error {
 	return syscall.EBADF
 }
 
-func (svr *Server) getHandle(handle string) (*os.File, bool) {
+func (svr *Server) getHandle(handle string) (SftpFileHandle, bool) {
 	svr.openFilesLock.RLock()
 	defer svr.openFilesLock.RUnlock()
 	f, ok := svr.openFiles[handle]
@@ -82,11 +83,12 @@ func NewServer(rwc io.ReadWriteCloser, options ...ServerOption) (*Server, error)
 		},
 	}
 	s := &Server{
-		serverConn:  svrConn,
-		debugStream: ioutil.Discard,
-		pktMgr:      newPktMgr(svrConn),
-		openFiles:   make(map[string]*os.File),
-		maxTxPacket: 1 << 15,
+		serverConn:    svrConn,
+		debugStream:   ioutil.Discard,
+		pktMgr:        newPktMgr(svrConn),
+		openFiles:     make(map[string]SftpFileHandle),
+		maxTxPacket:   1 << 15,
+		packetHandler: new(OsPacketHandler),
 	}
 
 	for _, o := range options {
@@ -106,6 +108,13 @@ func WithDebug(w io.Writer) ServerOption {
 	return func(s *Server) error {
 		s.debugStream = w
 		return nil
+	}
+}
+
+func SetPacketHandler(ph SftpPacketHandler) ServerOption {
+	return func(s *Server) error {
+		s.packetHandler = ph
+    return nil
 	}
 }
 
@@ -152,6 +161,93 @@ func (svr *Server) sftpServerWorker(pktChan chan orderedRequest) error {
 	return nil
 }
 
+type SftpPacketHandler interface {
+	Lstat(name string) (os.FileInfo, error)
+	Stat(name string) (os.FileInfo, error)
+  Mkdir(string, os.FileMode) error
+  Rmdir(string) error
+  Remove(string) error
+  Rename(string, string) error
+  Symlink(string, string) error
+  Readlink(string) (string, error)
+  Abs(string) (string, error)
+  OpenFile(string, int, os.FileMode)(SftpFileHandle, error)
+  Chmod(string,os.FileMode) error
+  Chtimes(string, time.Time, time.Time) error
+  Chown(string, int, int) error
+  Truncate(string, int64) error
+}
+
+type OsPacketHandler struct{}
+
+func (osph *OsPacketHandler) Lstat(name string) (os.FileInfo, error){
+	return os.Lstat(name)
+}
+
+func (osph *OsPacketHandler) Stat(name string) (os.FileInfo, error) {
+	return os.Stat(name)
+}
+
+func (osph *OsPacketHandler) Mkdir(path string, mode os.FileMode) error {
+	return os.Mkdir(path, mode)
+}
+
+func (osph *OsPacketHandler) Rmdir(path string) error {
+	return os.Remove(path)
+}
+
+func (osph *OsPacketHandler) Remove(path string) error {
+	return os.Remove(path)
+}
+
+func (osph *OsPacketHandler) Rename(oldpath, newpath string) error {
+	return os.Rename(oldpath, newpath)
+}
+
+func (osph *OsPacketHandler) Symlink(targetpath, linkpath string) error {
+	return os.Symlink(targetpath, linkpath)
+}
+
+func (osph *OsPacketHandler) Readlink(path string) (string, error) {
+	return os.Readlink(path)
+}
+
+func (osph *OsPacketHandler) Abs(path string) (string, error) {
+	return filepath.Abs(path)
+}
+
+func (osph *OsPacketHandler) OpenFile (name string, flag int, perm os.FileMode) (SftpFileHandle, error) {
+	return os.OpenFile(name, flag, perm)
+}
+
+func (osph *OsPacketHandler) Chmod(path string, mode os.FileMode) error {
+	return os.Chmod(path, mode)
+}
+
+func (osph *OsPacketHandler) Chtimes(path string, atime, mtime time.Time) error {
+	return os.Chtimes(path, atime, mtime)
+}
+
+func (osph *OsPacketHandler) Chown(path string, uid, gid int) error {
+  return os.Chown(path, uid, gid)
+}
+
+func (osph *OsPacketHandler) Truncate(path string, size int64) error {
+  return os.Truncate(path, size)
+}
+
+type SftpFileHandle interface {
+	io.WriterAt
+	io.ReaderAt
+	Stat() (os.FileInfo, error)
+	Name() string
+	Readdir(int) ([]os.FileInfo, error)
+	Truncate(int64) error
+	Chown(int, int) error
+	Chmod(os.FileMode) error
+	Close() error
+}
+
 func handlePacket(s *Server, p orderedRequest) error {
 	var rpkt responsePacket
 	switch p := p.requestPacket.(type) {
@@ -159,7 +255,7 @@ func handlePacket(s *Server, p orderedRequest) error {
 		rpkt = sshFxVersionPacket{Version: sftpProtocolVersion}
 	case *sshFxpStatPacket:
 		// stat the requested file
-		info, err := os.Stat(p.Path)
+		info, err := s.packetHandler.Stat(p.Path)
 		rpkt = sshFxpStatResponse{
 			ID:   p.ID,
 			info: info,
@@ -169,7 +265,7 @@ func handlePacket(s *Server, p orderedRequest) error {
 		}
 	case *sshFxpLstatPacket:
 		// stat the requested file
-		info, err := os.Lstat(p.Path)
+		info, err := s.packetHandler.Lstat(p.Path)
 		rpkt = sshFxpStatResponse{
 			ID:   p.ID,
 			info: info,
@@ -193,24 +289,24 @@ func handlePacket(s *Server, p orderedRequest) error {
 		}
 	case *sshFxpMkdirPacket:
 		// TODO FIXME: ignore flags field
-		err := os.Mkdir(p.Path, 0755)
+		err := s.packetHandler.Mkdir(p.Path, 0755)
 		rpkt = statusFromError(p, err)
 	case *sshFxpRmdirPacket:
-		err := os.Remove(p.Path)
+		err := s.packetHandler.Remove(p.Path)
 		rpkt = statusFromError(p, err)
 	case *sshFxpRemovePacket:
-		err := os.Remove(p.Filename)
+		err := s.packetHandler.Remove(p.Filename)
 		rpkt = statusFromError(p, err)
 	case *sshFxpRenamePacket:
-		err := os.Rename(p.Oldpath, p.Newpath)
+		err := s.packetHandler.Rename(p.Oldpath, p.Newpath)
 		rpkt = statusFromError(p, err)
 	case *sshFxpSymlinkPacket:
-		err := os.Symlink(p.Targetpath, p.Linkpath)
+		err := s.packetHandler.Symlink(p.Targetpath, p.Linkpath)
 		rpkt = statusFromError(p, err)
 	case *sshFxpClosePacket:
 		rpkt = statusFromError(p, s.closeHandle(p.Handle))
 	case *sshFxpReadlinkPacket:
-		f, err := os.Readlink(p.Path)
+		f, err := s.packetHandler.Readlink(p.Path)
 		rpkt = sshFxpNamePacket{
 			ID: p.ID,
 			NameAttrs: []sshFxpNameAttr{{
@@ -237,7 +333,7 @@ func handlePacket(s *Server, p orderedRequest) error {
 			rpkt = statusFromError(p, err)
 		}
 	case *sshFxpOpendirPacket:
-		if stat, err := os.Stat(p.Path); err != nil {
+		if stat, err := s.packetHandler.Stat(p.Path); err != nil {
 			rpkt = statusFromError(p, err)
 		} else if !stat.IsDir() {
 			rpkt = statusFromError(p, &os.PathError{
@@ -401,7 +497,7 @@ func (p sshFxpOpenPacket) respond(svr *Server) responsePacket {
 		osFlags |= os.O_EXCL
 	}
 
-	f, err := os.OpenFile(p.Path, osFlags, 0644)
+	f, err := svr.packetHandler.OpenFile(p.Path, osFlags, 0644)
 	if err != nil {
 		return statusFromError(p, err)
 	}
@@ -442,13 +538,13 @@ func (p sshFxpSetstatPacket) respond(svr *Server) responsePacket {
 	if (p.Flags & ssh_FILEXFER_ATTR_SIZE) != 0 {
 		var size uint64
 		if size, b, err = unmarshalUint64Safe(b); err == nil {
-			err = os.Truncate(p.Path, int64(size))
+			err = svr.packetHandler.Truncate(p.Path, int64(size))
 		}
 	}
 	if (p.Flags & ssh_FILEXFER_ATTR_PERMISSIONS) != 0 {
 		var mode uint32
 		if mode, b, err = unmarshalUint32Safe(b); err == nil {
-			err = os.Chmod(p.Path, os.FileMode(mode))
+			err = svr.packetHandler.Chmod(p.Path, os.FileMode(mode))
 		}
 	}
 	if (p.Flags & ssh_FILEXFER_ATTR_ACMODTIME) != 0 {
@@ -459,7 +555,7 @@ func (p sshFxpSetstatPacket) respond(svr *Server) responsePacket {
 		} else {
 			atimeT := time.Unix(int64(atime), 0)
 			mtimeT := time.Unix(int64(mtime), 0)
-			err = os.Chtimes(p.Path, atimeT, mtimeT)
+			err = svr.packetHandler.Chtimes(p.Path, atimeT, mtimeT)
 		}
 	}
 	if (p.Flags & ssh_FILEXFER_ATTR_UIDGID) != 0 {
@@ -468,7 +564,7 @@ func (p sshFxpSetstatPacket) respond(svr *Server) responsePacket {
 		if uid, b, err = unmarshalUint32Safe(b); err != nil {
 		} else if gid, _, err = unmarshalUint32Safe(b); err != nil {
 		} else {
-			err = os.Chown(p.Path, int(uid), int(gid))
+			err = svr.packetHandler.Chown(p.Path, int(uid), int(gid))
 		}
 	}
 
@@ -506,7 +602,7 @@ func (p sshFxpFsetstatPacket) respond(svr *Server) responsePacket {
 		} else {
 			atimeT := time.Unix(int64(atime), 0)
 			mtimeT := time.Unix(int64(mtime), 0)
-			err = os.Chtimes(f.Name(), atimeT, mtimeT)
+			err = svr.packetHandler.Chtimes(f.Name(), atimeT, mtimeT)
 		}
 	}
 	if (p.Flags & ssh_FILEXFER_ATTR_UIDGID) != 0 {
